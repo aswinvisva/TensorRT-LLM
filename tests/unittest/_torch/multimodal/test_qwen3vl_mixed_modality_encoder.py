@@ -9,12 +9,11 @@ input row identities. This lets us assert that mixed image+video requests
 produce a single ViT call whose output rows arrive in prompt order.
 """
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 
 from tensorrt_llm._torch.models.modeling_qwen3vl import Qwen3VisionModelBase
+from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 
 class _FakeVisual:
@@ -28,11 +27,10 @@ class _FakeVisual:
         self.hidden = hidden
         self.deepstack_layers = deepstack_layers
 
-    def __call__(self, pixel_values, grid_thw=None):
+    def __call__(self, pixel_values, grid_thw):
         # `pixel_values` is [P_total, marker_dim]; each row's first column
         # holds an integer identity marker. The "encoder" pools each item's
         # patches into a single row per item (grid_thw specifies item extent).
-        assert grid_thw is not None
         out_rows = []
         offset = 0
         markers = pixel_values[:, 0].tolist()
@@ -56,12 +54,14 @@ def _make_encoder():
 
 
 def _make_param(image=None, video=None, order=None):
+    # `image`, `video`, and `order` default to `None` so a test can omit
+    # whichever fields it doesn't need — every case populates at least one.
     data = {}
     if image is not None:
         data["image"] = image
     if video is not None:
         data["video"] = video
-    return SimpleNamespace(multimodal_data=data, mm_item_order=order)
+    return MultimodalParams(multimodal_data=data, mm_item_order=order)
 
 
 def _make_item_patches(marker: int, patches: int, dim: int = 2):
