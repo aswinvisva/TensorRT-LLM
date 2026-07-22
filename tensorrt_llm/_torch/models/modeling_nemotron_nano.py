@@ -712,8 +712,6 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         if self.video_pruning_rate <= 0:
             return mm_embedding, None
 
-        # Per-param `video` bucket (if any) provides `video_size`; image
-        # params contribute no EVS work.
         video_sizes_list = [
             (mm_data.get("video") or {}).get("video_size")
             for mm_data in multimodal_data_lst
@@ -750,11 +748,10 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         }
         plan: List[str] = []
         for multimodal_data in multimodal_data_list:
-            # `modality_type` is legacy metadata from single-modality-per-param
-            # requests; mixed-modality params drop it. Route on which raw
-            # bucket key is present instead. Vision handles at most one of
-            # image / video per param (mixed image+video-in-one-param would
-            # need per-item output rows, which this encoder does not emit).
+            # This encoder emits one row per param, so a mixed image+video
+            # param has no place to route. `_encode_vision` (mixin path)
+            # splits mixed params into virtual per-modality params before
+            # calling here.
             image_data = multimodal_data.get("image")
             video_data = multimodal_data.get("video")
             if (image_data is not None) == (video_data is not None):
@@ -767,14 +764,11 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
                 modality = "dynamic_image" if "image_sizes" in data else "fixed_tile"
             else:
                 data = video_data
-                modality = (
-                    "video_temporal"
-                    if self.video_temporal_patch_size > 1
-                    or isinstance(data["pixel_values"], list)
-                    # T==1 video with a tensor `pixel_values` is shape-identical
-                    # to a fixed-tile image, so it rides the same encoder.
-                    else "fixed_tile"
-                )
+                # T==1 video with tensor pixel_values shape-matches a fixed tile.
+                modality = ("video_temporal"
+                            if self.video_temporal_patch_size > 1
+                            or isinstance(data["pixel_values"], list)
+                            else "fixed_tile")
             plan.append(modality)
             buckets[modality].append(data)
 
@@ -2557,14 +2551,10 @@ _NANO_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
     },
     placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
     placeholders_separator="\n",
-    # Force STRING so serve pre-inserts placeholders (in `mm_item_order`
-    # send order) into a plain-string content, which Nano's chat template
-    # then consumes verbatim via its `message.content is string` branch.
-    # Auto-detection picks OPENAI for this template, but the OPENAI path
-    # feeds structured content_parts to Jinja, which regroups placeholders
-    # by hardcoded modality order — breaking the mm_item_order == prompt
-    # order invariant and desyncing per-item length labels from the mixin
-    # reorder.
+    # STRING pre-inserts placeholders in `mm_item_order` order; the OPENAI
+    # auto-detection would instead let Nano's Jinja regroup them by
+    # hardcoded modality order, breaking the `mm_item_order == prompt
+    # order` invariant the mixin reorder relies on.
     content_format=ContentFormat.STRING,
 )
 
@@ -3027,52 +3017,35 @@ class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
         return torch.cat(parts, dim=0)
 
     def _encode_vision(self, multimodal_params: List[MultimodalParams]) -> torch.Tensor:
-        """Vision group encoder: run the ViT over all image and video items.
+        """Vision group encoder_fn: ViT over image + video items, image rows first.
 
-        Contract: rows are laid out as image-items-across-requests first,
-        then video-items-across-requests, matching `EncoderGroup.modalities
-        = ("image", "video")`. When a video carries an extracted audio stream
-        (``multimodal_data["video"]["audio"]``), the sound encoder is called
-        here and per-video rows are interleaved as ``[vision, audio]`` so the
-        video item's row layout matches the ``<img_context>...<so_embedding>``
-        run in the prompt. Stashes ``num_tokens_in_video`` on each video
-        param for the EVS post-step.
+        Video-with-embedded-audio is encoded here and interleaved per-video
+        because it shares the video item's prompt-token run; standalone
+        audio parts go through the separate audio group. Stashes
+        `num_tokens_in_video` on each video param for the EVS post-step.
         """
-        # Feed the ViT one virtual param per modality (image or video) since
-        # `NanoV2VLVisionEncoder.forward` still bucket-dispatches on the
-        # legacy ``modality_type`` key.
-        image_views = [
-            MultimodalParams(
-                multimodal_data={"modality_type": "image", "image": p.multimodal_data["image"]}
-            )
-            for p in multimodal_params if p.multimodal_data.get("image") is not None
-        ]
-        video_params = [p for p in multimodal_params if p.multimodal_data.get("video") is not None]
-        video_views = [
-            MultimodalParams(
-                multimodal_data={"modality_type": "video", "video": p.multimodal_data["video"]}
-            )
-            for p in video_params
-        ]
+        # `NanoV2VLVisionEncoder.forward` bucket-dispatches on the legacy
+        # `modality_type` key, so wrap each image/video bucket in its own
+        # virtual param rather than relaxing that encoder's contract.
+        def _view(p, m):
+            return MultimodalParams(multimodal_data={"modality_type": m, m: p.multimodal_data[m]})
+
+        image_views = [_view(p, "image") for p in multimodal_params
+                       if p.multimodal_data.get("image") is not None]
+        video_params = [p for p in multimodal_params
+                        if p.multimodal_data.get("video") is not None]
 
         rows: List[torch.Tensor] = []
         if image_views:
-            image_embeds, _ = self.vision_encoder(image_views)
-            rows.extend(image_embeds)
-        if video_views:
-            video_embeds, video_num_tokens = self.vision_encoder(video_views)
-            # Extract-from-video audio: encode and interleave per-video so
-            # each video item's rows match its prompt-order ``<img_context>...
-            # <so_embedding>`` run. Standalone audio parts go through the
-            # separate audio group.
-            embedded_audio = [
-                p.multimodal_data["video"].get("audio")
-                for p in video_params
-            ]
+            rows.extend(self.vision_encoder(image_views)[0])
+        if video_params:
+            video_embeds, video_num_tokens = self.vision_encoder(
+                [_view(p, "video") for p in video_params]
+            )
+            embedded_audio = [p.multimodal_data["video"].get("audio") for p in video_params]
             audio_outputs = (
                 self._encode_audio([a for a in embedded_audio if a is not None])
-                if any(a is not None for a in embedded_audio) and self.sound_encoder is not None
-                else []
+                if any(embedded_audio) and self.sound_encoder is not None else []
             )
             audio_cursor = 0
             for i, (p, emb) in enumerate(zip(video_params, video_embeds)):
@@ -3094,39 +3067,29 @@ class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
         return torch.cat(rows, dim=0) if rows else torch.empty(0)
 
     def _encode_audio_group(self, multimodal_params: List[MultimodalParams]) -> torch.Tensor:
-        """Audio group encoder: run the sound encoder over standalone audio items."""
-        audio_data_list = [
-            p.multimodal_data["audio"]
-            for p in multimodal_params if p.multimodal_data.get("audio") is not None
-        ]
-        if not audio_data_list:
+        """Audio group encoder_fn: sound encoder over standalone audio items."""
+        if not multimodal_params:
             return torch.empty(0)
-        return torch.cat([emb for emb, _ in self._encode_audio(audio_data_list)], dim=0)
+        outs = self._encode_audio([p.multimodal_data["audio"] for p in multimodal_params])
+        return torch.cat([emb for emb, _ in outs], dim=0)
 
     @property
     def mm_encoder_groups(self) -> Tuple[EncoderGroup, ...]:
-        """Vision (image + video, shared ViT) and audio (sound encoder) groups."""
+        # `build_batched_input` is trivial: each encoder_fn takes the
+        # group-filtered params list directly.
+        pack = lambda params: {"multimodal_params": params}  # noqa: E731
         return (
-            EncoderGroup(
-                modalities=("image", "video"),
-                encoder_fn=self._encode_vision,
-                build_batched_input=lambda params: {"multimodal_params": params},
-            ),
-            EncoderGroup(
-                modalities=("audio",),
-                encoder_fn=self._encode_audio_group,
-                build_batched_input=lambda params: {"multimodal_params": params},
-            ),
+            EncoderGroup(("image", "video"), self._encode_vision, pack),
+            EncoderGroup(("audio",), self._encode_audio_group, pack),
         )
 
     def encode_multimodal_inputs(
         self, multimodal_params: List[MultimodalParams], **_: Any
     ) -> torch.Tensor:
-        mm_embeds = get_multimodal_embeddings(
+        return get_multimodal_embeddings(
             encoder_forward_fn=partial(encode_multimodal_by_groups, self.mm_encoder_groups),
             multimodal_params=list(multimodal_params),
-        )
-        return mm_embeds[0]
+        )[0]
 
     @torch.inference_mode()
     def forward(
