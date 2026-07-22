@@ -28,6 +28,7 @@ from ...inputs import (
     AudioData,
     BaseMultimodalDummyInputsBuilder,
     BaseMultimodalInputProcessor,
+    ContentFormat,
     ExtraProcessedInputs,
     MultimodalPlaceholderMetadata,
     MultimodalPlaceholderPlacement,
@@ -2556,6 +2557,15 @@ _NANO_VL_PLACEHOLDER_METADATA = MultimodalPlaceholderMetadata(
     },
     placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
     placeholders_separator="\n",
+    # Force STRING so serve pre-inserts placeholders (in `mm_item_order`
+    # send order) into a plain-string content, which Nano's chat template
+    # then consumes verbatim via its `message.content is string` branch.
+    # Auto-detection picks OPENAI for this template, but the OPENAI path
+    # feeds structured content_parts to Jinja, which regroups placeholders
+    # by hardcoded modality order — breaking the mm_item_order == prompt
+    # order invariant and desyncing per-item length labels from the mixin
+    # reorder.
+    content_format=ContentFormat.STRING,
 )
 
 
