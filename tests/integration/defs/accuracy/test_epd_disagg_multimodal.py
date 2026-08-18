@@ -108,11 +108,31 @@ def launch_multimodal_encoder_pd_llm(
     """Launch separate encoder and combined prefill/decode llmapi instances."""
     with contextlib.ExitStack() as stack:
         stack.enter_context(mock.patch.dict(os.environ, {"TLLM_MULTIMODAL_DISAGGREGATED": "1"}))
-        thread_pool = stack.enter_context(MyThreadPoolExecutor(max_workers=max_workers))
         encoder = MultimodalEncoder(model=model_name, **encoder_llm_config)
         pd_llm = LLM(model=model_name, **pd_llm_config)
-        with encoder, pd_llm:
-            yield _MultimodalEncoderPDAdapter(encoder, pd_llm, thread_pool)
+
+        # Teardown order matters (nvbugs/6327718). All three go on the one
+        # ExitStack, entered LLMs-first and pool-last, so unwinding runs:
+        #     thread_pool -> pd_llm -> encoder -> env patch
+        # i.e. the request pool is fully drained before either proxy shuts down.
+        #
+        # The previous form put the pool on the stack but wrapped the LLMs in a
+        # nested `with encoder, pd_llm:`. Being inner, that nested block always
+        # unwound FIRST, so the pool outlived both LLMs. When a worker died
+        # mid-run, generate_async().result() raised, the nested `with` tore down
+        # each proxy, and GenerationExecutorProxy.shutdown() -> ZeroMqQueue
+        # .close() ran socket.close()/context.term() while this pool's threads
+        # were still inside proxy.submit() -> ipc.py _send_data() ->
+        # socket.send() on those same sockets. Destroying a ZMQ socket under a
+        # live sender trips libzmq's signaler.cpp assert -> abort().
+        #
+        # MyThreadPoolExecutor.__exit__ cancels rather than waits on the
+        # exception path, so draining first cannot deadlock on futures blocked
+        # against an already-dead engine.
+        stack.enter_context(encoder)
+        stack.enter_context(pd_llm)
+        thread_pool = stack.enter_context(MyThreadPoolExecutor(max_workers=max_workers))
+        yield _MultimodalEncoderPDAdapter(encoder, pd_llm, thread_pool)
 
 
 @dataclass(frozen=True)
@@ -225,6 +245,14 @@ class EPDVariant:
             ),
             max_batch_size=128,
             expected_quant_algo=QuantAlgo.MIXED_PRECISION,
+            # Match nano_omni_fp8 (nvbugs/6327718). The teardown-ordering fix
+            # above removes the sender side of the shutdown race, but the
+            # dispatcher thread that GenerationExecutorProxy.shutdown() leaks
+            # after its bounded join is internal to the proxy and still parked
+            # in ZeroMqQueue._recv_data(). Capping concurrency bounds how much
+            # work is in flight when a worker dies, which is what took fp8 from
+            # 2.63% to 0.00% when the same cap landed for it in #16672.
+            max_workers=16,
         )
 
 
