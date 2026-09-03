@@ -3424,9 +3424,17 @@ class NemotronH_Nano_VL_V2(MultimodalModelMixin, transformers.PreTrainedModel):
             inputs_embeds=input_embeds,
             return_context_logits=return_context_logits,
             lora_params=kwargs.get("lora_params", None),
+            # Required by one-model speculative decoding. Omitting them silently
+            # disables MTP: Mamba2Mixer takes the non-speculative conv1d path,
+            # and the draft KV cache manager is never found.
+            spec_metadata=kwargs.get("spec_metadata", None),
+            resource_manager=kwargs.get("resource_manager", None),
         )
 
-        logger.debug(f"output shape: {output_prob.shape}")
+        # A dict, not logits, under one-model speculative decoding.
+        logger.debug(
+            f"output shape: {getattr(output_prob, 'shape', type(output_prob).__name__)}"
+        )
         return output_prob
 
     @staticmethod
